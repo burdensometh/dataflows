@@ -88,6 +88,7 @@ Type "help", "copyright", "credits" or "license" for more information.
 	* Data package based and compatible
 * Processors can be a function (or a class) processing row-by-row, resource-by-resource or a full package
 * A pre-existing decent contrib library of Readers (Collectors) and Processors and Writers
+* Rejected rows are kept, not lost - fix a single value and replay just that row through the same cleaning chain ([`reject_rows`](PROCESSORS.md#reject_rows))
 
 ## Learn more
 

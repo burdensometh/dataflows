@@ -18,6 +18,8 @@ from .finalizer import finalizer
 from .find_replace import find_replace
 from .join import join, join_self, join_with_self
 from .parallelize import parallelize
+from .rejects import reject_rows, replay_rejected, RejectionStore, SQLiteTarget
+from .rejects import STATUS_ACCEPTED, STATUS_FILTERED, STATUS_REJECTED
 from .rename_fields import rename_fields
 from .select_fields import select_fields
 from .set_primary_key import set_primary_key

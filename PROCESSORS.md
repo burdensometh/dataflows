@@ -16,6 +16,7 @@ DataFlows comes with a few built-in processors which do most of the heavy liftin
 - [**finalizer**](#finalizer) - Call a function when all data had been processed
 - [**checkpoint**](#checkpoint) - Cache results of a subflow in a datapackage and load it upon request
 - [**parallelize**](#parallelize) - Run a row processor over multiple processes
+- [**reject_rows**](#reject_rows) - Run a cleaning chain and persist the rows it rejects, so they can be corrected and replayed individually
 
 ### Manipulate row-by-row
 - [**add_field**](#add_field) - Adds a column to the data
@@ -385,7 +386,150 @@ Flow(
 ```
 
 
+
+#### reject_rows
+
+Run an ordinary, row-wise cleaning chain so that **failing rows are not dropped
+silently and do not block the whole run**.  Rejected rows are persisted in a
+SQLite ledger together with their original values, the failing stage and the
+reason; only rows that pass the chain continue downstream.  A rejected row can
+later be corrected and replayed *through the same chain* - without rerunning
+the rest of the data.
+
+```python
+def reject_rows(steps, db=None, path=None, store=None, resource=None,
+                id_field=None, id_prefix='', add_id_field=None, target=None,
+                record_accepted=False):
+    pass
+```
+
+- `steps` - The cleaning chain to run: a list of ordinary DataFlows steps
+  (processors or row/rows functions), a `Flow`, or a single step.
+  The chain must be row-wise: a step may **filter** a source row (produce no
+  output) or **expand** it (produce several outputs), but must not reorder or
+  buffer the entire resource (`sort_rows`, `join`, `deduplicate`, ...).
+- `db` / `path` - Path of the SQLite ledger file (default `rejects.db`).
+- `store` - An existing `RejectionStore` to reuse instead of opening a new one.
+- `resource` - Which resources the cleaning chain applies to; same semantics
+  as in the `load` processor.
+- `id_field` - Optional name of a source field to derive the stable row id
+  from.  By default ids are positional (`<resource>:<row-number>`), which is
+  stable between runs over the same source.  With `id_field` the id survives
+  reordering of the source (`<resource>:<field>=<value>`).
+- `id_prefix` - Optional namespace prepended to every generated id.
+- `add_id_field` - Optional name of a column that is added to output rows and
+  contains the stable source-row id.  Recommended when the downstream
+  `dump_to_sql` table must be traceable back to its source rows, and required
+  for replay to replace rows produced by the bulk run.
+- `target` - Default SQLite target for replay: `dict(path=..., table=...)`
+  (or `dict(engine='sqlite:///...', table=...)`), or a `SQLiteTarget`.
+- `record_accepted` - Also record passing/filtered rows in the ledger
+  (default: only rejections are recorded).
+
+**Source row ids and rejection data**
+
+Every source row is identified by a stable id (`people:42`, or
+`people:sku=A17` with `id_field='sku'`).  For each rejected row the ledger
+stores:
+
+- `original` - the source row exactly as it entered the chain,
+- `stage_index` / `stage_name` - which step rejected it,
+- `reason` / `error_type` - why it failed,
+- `attempts` - how many times it was seen.
+
+**Replaying a corrected row**
+
+```python
+rejects = reject_rows([set_type('age', type='integer'), normalize], db='ledger.db',
+                      target=dict(path='warehouse.db', table='people'),
+                      add_id_field='source_id')
+
+# ... run the flow ...
+for record in rejects.store.rejected():
+    print(record['id'], record['stage_name'], record['reason'])
+
+# Correct only the original value, then replay only these rows:
+rejects.store.correct('people:2', age='42')
+rejects.replay(['people:2'])
+
+# or every currently rejected row:
+rejects.replay()
+```
+
+`replay(ids=None, target=None, steps=None, force=False)`:
+
+- `ids` - one id, a list of ids, or `None` (all currently rejected rows).
+- `target` - override the processor's default SQLite target.
+- `steps` - override the cleaning chain (defaults to the same `steps`).
+- `force` - replay a row that is already accepted (default `False`).
+
+Guarantees of a replay:
+
+- **All-or-nothing**: all rows produced by one source row *and* its new
+  status are committed in one SQLite transaction.  If anything fails, no
+  partial expansion is left behind, and the row stays (or becomes) rejected.
+- **Idempotent**: rows written by an earlier replay of the same source id are
+  replaced, never duplicated.  Replaying the same row twice does not create
+  two copies.
+- **Byte-for-byte the same chain**: replay runs the *same* ordinary steps, so
+  the corrected row gets exactly the production treatment.
+
+Rows which are filtered out by the chain receive the `filtered` status and
+produce no target rows.
+
+**Querying the ledger**
+
+`rejects.store` is a `RejectionStore` with these methods:
+
+- `get(id)` - the full record (original, corrected, status, stage, reason...).
+- `rejected()`, `accepted()`, `filtered()` - lists of records by status.
+- `query(status=..., resource=..., limit=...)` - filtered listing.
+- `ids(status=..., resource=...)` - just the ids.
+- `reason(id)` - the *current* rejection reason, or `None` once accepted.
+- `last_reason(id)` - the reason from the last attempt.
+- `original(id)` / `effective_row(id)` - source value / value that will be
+  replayed (corrected if set).
+- `correct(id, row=None, **changes)` - set the corrected original value.
+- `clear_correction(id)`, `forget(id)`, `clear()`.
+- `results(id)` - rows produced by the last successful replay.
+- `target_results(id)` - rows currently in the SQLite target for this id.
+
+A minimal end-to-end example:
+
+```python
+from dataflows import Flow, load, set_type, dump_to_sql, reject_rows
+
+rejects = reject_rows(
+    [set_type('age', type='integer')],
+    db='out/ledger.db',
+    target=dict(path='out/warehouse.db', table='people'),
+    add_id_field='source_id',
+)
+
+Flow(
+    load('people.csv'),
+    rejects,
+    dump_to_sql(dict(people={'resource-name': 'people'}),
+                engine='sqlite:///out/warehouse.db'),
+).process()
+
+# Fix and replay a single bad row - the rest of the data is not reprocessed.
+rejects.store.correct('people:3', age='42')
+rejects.replay(['people:3'])
+assert rejects.store.reason('people:3') is None
+assert rejects.target_results('people:3')[0]['age'] == 42
+```
+
+Note: the ledger and the `dump_to_sql` target may be the same SQLite file or
+different ones; replay attaches the target database to the ledger connection
+so both updates commit together.
+
+For convenience the package root also exports `RejectionStore`,
+`SQLiteTarget`, `replay_rejected` and the `STATUS_REJECTED` / `STATUS_ACCEPTED`
+/ `STATUS_FILTERED` constants.
+
 ### Manipulate row-by-row
+
 #### add_field
 Adds a new field (column) to the streamed resources
 
