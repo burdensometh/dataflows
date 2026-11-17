@@ -18,3 +18,30 @@ class ProcessorError(DataflowsException):
 
 class SourceLoadError(DataflowsException):
     pass
+
+
+class MergedSchemaError(DataflowsException):
+    """Raised when a unified schema can't be determined for a merged load."""
+    pass
+
+
+class IncompatibleTypeError(MergedSchemaError):
+    """Raised when a field holds values which can't be unified into a single type."""
+
+    def __init__(self, field_name, types, origins=None):
+        self.field_name = field_name
+        self.types = list(types)
+        self.origins = origins or {}
+        details = ', '.join(
+            '{} (in {})'.format(t, self.origins[t]) if t in self.origins else t
+            for t in self.types
+        )
+        super().__init__(
+            'Field {!r} has incompatible types across the merged inputs: {}'
+            .format(field_name, details)
+        )
+
+
+class ExplicitFieldError(MergedSchemaError):
+    """Raised when loaded data doesn't match an explicitly declared field."""
+    pass

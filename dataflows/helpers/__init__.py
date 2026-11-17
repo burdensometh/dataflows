@@ -3,3 +3,4 @@ from .rows_processor import rows_processor
 from .datapackage_processor import datapackage_processor
 from .iterable_loader import iterable_loader
 from .resource_matcher import ResourceMatcher
+from .merged_schema import SchemaScanner, MergedSchema, build_merged_schema

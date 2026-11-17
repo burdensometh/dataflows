@@ -53,6 +53,7 @@ def load(source, name=None, resources=None, strip=True, limit_rows=None,
          infer_strategy=None, cast_strategy=None,
          override_schema=None, override_fields=None,
          deduplicate_headers=False,
+         merge=False,
          on_error=raise_exception,
          **options)
     pass
@@ -66,11 +67,13 @@ def load(source, name=None, resources=None, strip=True, limit_rows=None,
     - a reference to an environment variable containing the source location,
       in the form of `env://ENV_VAR`
     - a tuple containing (datapackage_descriptor, resources_iterator)
+    - a list of any of the above, to be loaded together (see `merge` below)
     - Other supported links, based on the current support of schemes and formats in [tabulator](https://github.com/frictionlessdata/tabulator-py#schemes)
     - Other formats:
       - XML files
       - Excel-XML format
       - SQL Sources, which on top the current the functionality already supported in `tabulator`, also supports the `query` parameter for using custom query results as a source.
+    - When `merge=True`, a local directory or a glob pattern (e.g. `data/2020-*.csv`) stands for all the files it contains / matches, sorted by name.
 
 - `resources` - optional, relevant only if source points to a datapackage.json file or datapackage/resource tuple. Value should be one of the following:
     - Name of a single resource to load
@@ -98,6 +101,13 @@ Relevant only when _not_ loading data from a datapackage:
     - `values (str[])` - an alternative list of missing values (default: `schema['missingValues']`)
 - `override_fields` - Provided mapping will patch the inferred `schema.fields` array. In the mapping keys must be field names and values must be dictionaries intended to be merged into the corresponding field's metadata.
 - `deduplicate_headers` - (default `False`) If there are duplicate headers and the flag is set to `True` it will rename them using a `header (1), header (2), etc` approach. If there are duplicate headers and the flag is set to `False` it will raise an error.
+- `merge` - (default `False`) Load all the selected inputs as a single table (one resource), instead of one resource per input. When set, the fields and their types are decided for the whole batch of inputs, and not by the first input or by a sample of it:
+    - The field set is the union of the inputs' fields, ordered by first appearance across the inputs.
+    - A field which is missing from some inputs is `None` in those inputs' rows.
+    - A field's type is unified across all inputs: missing values are ignored, `integer` is promoted to `number` when another input holds decimals, and any other combination of types fails with an `IncompatibleTypeError` naming the offending inputs.
+    - Explicit declarations (`override_schema['fields']` / a `type` in `override_fields`) take precedence over inference, and are validated strictly - a value which does not match its declared type raises an `ExplicitFieldError` rather than being dropped or coerced, even when an `on_error` handler is given.
+    - Every row of every input is converted to the final schema before being passed to the following flows, so the data has one consistent shape regardless of the input it came from.
+    - Inputs which can only be iterated once (generators, remote streams) are supported: rows read while the schema is being determined are spooled to temporary storage, which is not limited by the number of rows and never keeps the whole batch in memory.
 - `on_error` - Dictates how `load` will behave in case of a validation error.
     Options are identical to `on_error` in `set_type` and `validate`
 
