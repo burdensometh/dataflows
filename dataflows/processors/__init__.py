@@ -30,3 +30,16 @@ from .update_package import update_package, add_metadata
 from .update_resource import update_resource
 from .update_schema import update_schema
 from .update_stats import update_stats
+from .incremental_rollup import (
+    incremental_rollup,
+    incremental_summary,
+    incremental_summary_to_sql,
+    incremental_rollup_to_sql,
+    incremental_dump_to_sql,
+    incremental_aggregate,
+    rollup_to_sql,
+    rollup,
+    summarize_to_sql,
+    dump_to_sql_incremental,
+    IncrementalRollup,
+)

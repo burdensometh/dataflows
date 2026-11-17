@@ -10,6 +10,7 @@ DataFlows comes with a few built-in processors which do most of the heavy liftin
 - [**dump_to_path**](#dump_to_path) - Store the results to a specified path on disk, in a valid datapackage
 - [**dump_to_zip**](#dump_to_zip) - Store the results in a valid datapackage, all files archived in one zipped file
 - [**dump_to_sql**](#dump_to_sql) - Store the results in a relational database (creates one or more tables or updates existing tables)
+- [**incremental_rollup**](#incremental_rollup) - Maintain exact per-group roll-ups in SQLite from versioned, changing details, without full recomputation
 
 ### Flow Control
 - [**conditional**](#conditional) - Run parts of the flow based on the structure of the datapackage at the calling point
@@ -250,6 +251,59 @@ def dump_to_sql(tables,
 - `updated_id_column` - Optional name of a column that will be added to the output data containing the id of the updated row in DB.
 - `batch_size` - Maximum amount of rows to write at the same time to the DB (default 1000)
 - `use_bloom_filter` - Preprocess existing DB data to improve update performance (default: True)
+
+#### incremental_rollup
+Maintain exact per-group roll-ups in SQLite from versioned, changing details, without recomputing the report after every batch.
+
+```python
+def incremental_rollup(engine='env://DATAFLOWS_DB_ENGINE',
+                       summary_table='rollup_summary',
+                       detail_table='rollup_details',
+                       key='id', version='version',
+                       group_by=None, amount='amount',
+                       distinct=None, deleted=None,
+                       resources=None, batch_id=None,
+                       count_column='row_count', sum_column='amount_sum',
+                       distinct_prefix='distinct_',
+                       reset=False, rebuild=False):
+    pass
+```
+
+The processor consumes a stream of *detail records*. Each record is identified by a stable id and carries a version. A record either holds the complete new value of that detail, or marks it as deleted:
+
+```python
+Flow(
+    load('daily_changes.csv'),
+    incremental_rollup(
+        engine='sqlite:///reports.db',
+        summary_table='daily_report',
+        detail_table='business_details',
+        key='record_id',
+        version='change_version',
+        group_by=['branch', 'currency'],
+        amount='amount',
+        distinct=['customer_id'],
+    ),
+)
+```
+
+- `engine` - SQLite database (same conventions as `dump_to_sql`: `sqlite:///relative.db`, `sqlite:////absolute.db`, `env://VARIABLE`, a plain path, `:memory:`, a SQLAlchemy engine or an `sqlite3.Connection`)
+- `summary_table` - Table with one row per **non-empty** group. It has the group-by columns, `row_count`, `amount_sum` and one `distinct_<field>` column per distinct field.
+- `detail_table` - Table holding the latest version of every record, including tombstones for deleted records and the contribution currently counted in the summary.
+- `key` - Stable record id field (or a list of fields for a composite key). Sent through the canonical encoder, so `1`, `1.0`, `True` and `"1"` stay distinct ids.
+- `version` - Version field. Versions must keep one type across messages (numbers, strings and timestamps are supported). A message whose version is **lower than or equal to** the stored version is ignored, which makes duplicate delivery a no-op. Versions for which no ordering is defined (e.g. `None`) cannot be compared with a stored version.
+- `group_by` - Grouping field(s). A group whose last detail is deleted (or moves to another group) is removed from the summary.
+- `amount` - Amount field. Missing values count as `0`; numeric strings are accepted; sums are kept in decimal so they are exact. Stored as an integer when integral, so SQLite reports `15` and not `15.0`.
+- `distinct` - Field name(s) whose **exact** number of distinct non-`NULL` values is maintained per group. A mapping `{field: output_column}` is also accepted. `NULL` values are never counted.
+- `deleted` - Optional boolean field marking deletes. When omitted, common names (`deleted`, `is_deleted`, `deleted_at`, `op`/`operation` with `delete`) are detected automatically.
+- `batch_id` - Optional batch identifier, stored in the detail rows and in the internal state table. When omitted, a monotonically increasing id is allocated in the database.
+- `count_column` / `sum_column` / `distinct_prefix` - Names of the generated columns (defaults `row_count`, `amount_sum`, `distinct_`).
+- `reset` - Drop the roll-up tables before processing.
+- `rebuild` - Recompute the summary from the stored current detail rows before processing. This is the only operation that walks all details (equally, the summary is recovered automatically if it is lost while the details remain).
+
+Every batch runs in one transaction: the detail rows, the distinct-value reference counts and the summary rows are applied together, so an error leaves both the details and the summary untouched. Only the groups whose contribution actually changed are rewritten; a new version with identical values does not touch the summary at all.
+
+The result is idempotent and equal to a full aggregation over the current details: re-running a batch, re-delivering records, re-opening the database or rebuilding all produce the same summary. The record rows pass through the processor unchanged, so it can be placed anywhere in a flow. Processor stats include `rollup_applied`, `rollup_deleted`, `rollup_ignored`, `rollup_groups_updated`, `rollup_groups_removed` and `rollup_batches`; `processor.summary()` returns the current summary rows, `processor.details()` the current details and `processor.rebuild()` forces a full recomputation.
 
 ### Flow Control
 
