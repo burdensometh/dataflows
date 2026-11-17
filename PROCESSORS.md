@@ -315,10 +315,9 @@ Flow(
 
 Save results from running a series of steps, if checkpoint exists - loads from checkpoint instead of running the steps.
 
-Checkpoint invalidation should be handled manually - by deleting the checkpoint path (by default at `.checkpoints/<checkpoint_name>`)
-
 ```python
-def checkpoint(checkpoint_name, checkpoint_path='.checkpoints', steps=None, resources=None):
+def checkpoint(checkpoint_name, checkpoint_path='.checkpoints', steps=None, resources=None,
+               input_files=None, transformation_version=None, parameters=None):
     pass
 ```
 
@@ -326,6 +325,47 @@ def checkpoint(checkpoint_name, checkpoint_path='.checkpoints', steps=None, reso
 - `checkpoint_path` - Relative or absolute path to save checkpoints at, default to relative path `.checkpoints`
 - `steps` - Iterable of steps to checkpoint, when not provided, uses the previous steps in the flow
 - `resources` - Limit the checkpointing only to specific resources, same semantics as `load` processor `resources` argument
+- `input_files` - Optional list of input files the prefix depends on. Each entry is a path string or a
+  `{'name': ..., 'path': ...}` mapping. Files are identified by their SHA-256 content hash, never by
+  modification time, so editing the data invalidates the cache while touching the timestamp does not.
+- `transformation_version` - Optional version of the transformation/cleaning logic. Bump it whenever the
+  code of the prefixed steps changes.
+- `parameters` - Optional dict of cleaning parameters. Comparison is content-based (dict ordering does not
+  matter). Values must be JSON serializable.
+
+**Legacy mode** - when neither `input_files` nor `transformation_version` is provided, behavior is
+unchanged: the checkpoint is reused whenever its stream file exists, and invalidation stays manual
+(delete the checkpoint directory).
+
+**Verified mode** - declaring `input_files` and/or `transformation_version` enables automatic
+invalidation. The prefix is skipped only when a *completed* record matches all of:
+
+- the content hash of every declared input file,
+- the transformation version,
+- the cleaning parameters,
+- the content hash, datapackage descriptor (field types and resource schemas) and per-resource row
+  counts of the cached stream itself.
+
+Any mismatch - including a corrupt or partially written cache - rebuilds the checkpoint. A prefix that
+fails or is only partially consumed never replaces an existing cache. Concurrent writers are serialized
+with an OS lock and readers can only observe a complete version, because the stream and its metadata are
+each committed via an atomic rename.
+
+```python
+from dataflows import Flow, load, checkpoint, set_type
+
+Flow(
+    load('data/input.csv'),
+    set_type('amount', type='number'),
+    checkpoint(
+        'clean_input',
+        input_files=['data/input.csv'],
+        transformation_version='v3',
+        parameters={'strip_whitespace': True, 'null_literal': 'N/A'},
+    ),
+    # further steps ...
+).process()
+```
 
 To improve code readability, the checkpoint processor can be placed anywhere in the flow and it will checkpoint the previous steps:
 

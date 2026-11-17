@@ -18,3 +18,7 @@ class ProcessorError(DataflowsException):
 
 class SourceLoadError(DataflowsException):
     pass
+
+
+class CheckpointError(DataflowsException):
+    pass
