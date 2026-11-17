@@ -4,10 +4,12 @@ DataFlows comes with a few built-in processors which do most of the heavy liftin
 
 ### Load and Save Data
 - [**load**](#load) - Loads data from various source types (local files, remote URLS, Google Spreadsheets, databases...)
+- [**load_versioned**](#load_versioned) - Loads a versioned package, pinning the version when loading starts
 - [**sources**](#sources) - Combines efficiently data loading from multiple sources
 - [**printer**](#printer) - Just prints whatever it sees. Good for debugging.
 
 - [**dump_to_path**](#dump_to_path) - Store the results to a specified path on disk, in a valid datapackage
+- [**dump_to_versioned_path**](#dump_to_versioned_path) - Publish the results as an atomic, immutable local version (failures keep the previous version)
 - [**dump_to_zip**](#dump_to_zip) - Store the results in a valid datapackage, all files archived in one zipped file
 - [**dump_to_sql**](#dump_to_sql) - Store the results in a relational database (creates one or more tables or updates existing tables)
 
@@ -109,6 +111,31 @@ Some deprecated options:
     (equivalent to `cast_strategy = CAST_WITH_SCHEMA, on_error = raise_exception`)
 
 
+#### load_versioned
+Loads a package published by [**dump_to_versioned_path**](#dump_to_versioned_path).
+
+The version is resolved once, when the flow starts processing: the package's `current` symlink is pinned to a concrete version directory, so republishing a new version while resources are still being iterated does not change the data this reader sees. Old versions remain readable by id.
+
+```python
+def load_versioned(package_path, version=None, **options):
+    pass
+```
+
+- `package_path` - root directory of the versioned package (the directory containing the `current` symlink and the `versions/` directory). Any path inside it (e.g. the `current` directory itself) is also accepted - the root is found by walking upwards.
+- `version` - which version to read:
+    - `None` or `'current'` (the default) - the latest published version, pinned at load start.
+    - an integer or numeric string (e.g. `1`, `'2'`) - an explicit, possibly old, version.
+- `options` - any other [**load**](#load) option (`resources`, `cast_strategy`, `on_error`, ...) is forwarded unchanged.
+
+```python
+# Pin the current version when loading starts, then iterate safely
+results, dp, stats = Flow(load_versioned('data/pkg')).results()
+
+# Re-read an older version explicitly
+results, dp, stats = Flow(load_versioned('data/pkg', version=1)).results()
+```
+
+
 #### sources
 Combines efficiently data loading from multiple sources
 
@@ -200,6 +227,45 @@ def dump_to_path(out_path='.',
     - `update_existing` - Instead of creating a new file, update the file specified by this option (needs to be a string path to the excel file).
                           If the file does not exist, it will be created in this location.
                           If a sheet with the same name exists, it will be removed and re-added.
+
+#### dump_to_versioned_path
+Publish the results as an atomic, immutable local version of a datapackage.
+
+Unlike `dump_to_path`, resource files and the final `datapackage.json` are never written where readers can see them while the flow is running. Everything is first built in a private staging directory. Only after every resource has been transformed and validated successfully is the staging directory published atomically as a new version and the `current` symlink repointed at it. If any step fails, the partial output is discarded and the previous version remains available - readers can never observe old and new files mixed together.
+
+```python
+def dump_to_versioned_path(out_path='.', **options):
+    pass
+```
+
+- `out_path` - root directory of the versioned package. Created if missing. Its layout is:
+
+  ```
+  out_path/
+    current -> versions/<latest>     # symlink, atomically switched on publish
+    index.json                       # registry with one metadata entry per version
+    versions/
+      1/
+        datapackage.json
+        <resource files...>
+      2/
+        ...
+  ```
+
+- `options` - all `dump_to_path` options (`format`, `use_titles`, `counters`, `pretty_descriptor`, ...) are supported; the same format writers are reused.
+
+Each published version is self-contained and stores, in its `datapackage.json`, the real row counts, byte sizes and hashes of every resource - including empty resources, which are still written with a row count of zero. The same summary (per-resource row counts/bytes/hash, package totals and a UTC `published_at` timestamp) is recorded in `index.json`.
+
+Pair this processor with [**load_versioned**](#load_versioned) so that readers pin a version when they start loading and keep reading that exact data even if a new version is published mid-iteration. Old versions can always be re-read by id.
+
+```python
+Flow(
+    load('input.csv'),
+    set_type('age', type='integer'),   # validation failure here => no new version
+    dump_to_versioned_path('data/pkg'),
+).process()
+```
+
 
 #### dump_to_zip
 Store the results in a valid datapackage, all files archived in one zipped file
