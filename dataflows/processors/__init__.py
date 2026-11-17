@@ -1,4 +1,5 @@
 from .load import load
+from .load_changes import load_changes
 from .printer import printer
 from .set_type import set_type
 from .validate import validate

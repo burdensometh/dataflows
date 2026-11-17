@@ -18,3 +18,7 @@ class ProcessorError(DataflowsException):
 
 class SourceLoadError(DataflowsException):
     pass
+
+
+class ChangeConflictError(DataflowsException):
+    pass

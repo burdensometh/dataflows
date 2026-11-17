@@ -10,6 +10,7 @@ DataFlows comes with a few built-in processors which do most of the heavy liftin
 - [**dump_to_path**](#dump_to_path) - Store the results to a specified path on disk, in a valid datapackage
 - [**dump_to_zip**](#dump_to_zip) - Store the results in a valid datapackage, all files archived in one zipped file
 - [**dump_to_sql**](#dump_to_sql) - Store the results in a relational database (creates one or more tables or updates existing tables)
+- [**load_changes**](#load_changes) - Load row changes (upserts & deletes, possibly repeated and out of order) into a SQLite "current" table
 
 ### Flow Control
 - [**conditional**](#conditional) - Run parts of the flow based on the structure of the datapackage at the calling point
@@ -250,6 +251,75 @@ def dump_to_sql(tables,
 - `updated_id_column` - Optional name of a column that will be added to the output data containing the id of the updated row in DB.
 - `batch_size` - Maximum amount of rows to write at the same time to the DB (default 1000)
 - `use_bloom_filter` - Preprocess existing DB data to improve update performance (default: True)
+
+#### load_changes
+Load row changes from a collector - which may deliver them repeatedly and out of order - into a SQLite "current" table.
+
+```python
+def load_changes(table, keys=None, *,
+                 version_field='version', op_field='op', batch_field='batch_id',
+                 upsert_op='upsert', delete_op='delete',
+                 source='default', resources=None,
+                 engine='env://DATAFLOWS_DB_ENGINE'):
+    pass
+```
+
+Each incoming row is a change record containing the business key field(s), a monotonic version, an
+operation (`upsert` = store the full row values, `delete` = remove the row), a source batch id and the
+complete row values. Cleaning and reshaping of the change records is done with regular flow steps
+(e.g. row functions, `set_type`, `validate`) placed before `load_changes` in the flow.
+
+Semantics:
+
+- Only changes with a version newer than the stored version for the key are applied.
+- A record with the same version and the same content as the stored one is a safe no-op (replay).
+- A record with the same version but different content raises a `ChangeConflictError`.
+- Deletes keep a tombstone (key + version) behind, so older updates arriving afterwards cannot
+  resurrect a deleted record. A newer version may still revive the key.
+
+For every source batch, the target rows, the per-key versions and the batch progress marker are
+committed together in a single transaction. If a batch fails, nothing from it is persisted and its
+progress does not advance. Already committed batches are skipped, so re-running the flow (e.g. after
+a restart) continues where the previous run left off. Records of one batch are expected to arrive
+contiguously.
+
+Three tables are maintained in the target database:
+
+- `<table>` - the "current" table with the latest row values per business key
+- `<table>__versions` - per business key: latest version, content hash and a deleted (tombstone) flag
+- `<table>__batches` - ids of source batches which were fully committed
+
+Parameters:
+
+- `table` - name of the target ("current") table
+- `keys` - business key field name(s). If not provided, the resource schema's `primaryKey` is used.
+- `version_field` - name of the field holding the monotonic version (default `version`)
+- `op_field` - name of the field holding the operation (default `op`)
+- `batch_field` - name of the field holding the source batch id (default `batch_id`)
+- `upsert_op` / `delete_op` - the operation values meaning upsert and delete
+  (defaults `upsert` and `delete`)
+- `source` - name of the change source, used for tracking batch progress (default `default`)
+- `resources` - which resources to load (name, regex, list or index; default: all)
+- `engine` - Connection string for connecting to the SQL Database (URL syntax).
+  Also supports `env://<environment-variable>`, which indicates that the connection string should be
+  fetched from the indicated environment variable. If not specified, assumes a default of
+  `env://DATAFLOWS_DB_ENGINE`
+
+Example:
+
+```python
+from dataflows import Flow, load_changes
+
+def clean(row):
+    row['name'] = row['name'].strip()
+
+Flow(
+    change_records,   # e.g. dicts with id, name, version, op, batch_id
+    clean,
+    load_changes('customers_current', keys=['id'],
+                 engine='sqlite:///out/current.db'),
+).process()
+```
 
 ### Flow Control
 
