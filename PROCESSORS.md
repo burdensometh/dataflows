@@ -353,7 +353,8 @@ f.process()
 Run a row processor over multiple processes, making to make better use of multiple cores and compensate for long i/o waits.
 
 ```python
-def parallelize(row_func, num_processors=None, predicate=None, resources=None):
+def parallelize(row_func, num_processors=None, predicate=None, resources=None,
+                strict=False, max_in_flight=None):
     pass
 ```
 
@@ -361,11 +362,41 @@ def parallelize(row_func, num_processors=None, predicate=None, resources=None):
 - `num_processors` - Number of processors to use. If not specified, will make an educated guess based on the current machine's architecture.
 - `predicate` - A function which accepts a row and returns a boolean. If provided, only rows for which `predicate(row) is True` will be processed, others will be passed through unmodified.
 - `resources` - Only apply the function on specific resources, same semantics as `load` processor `resources` argument
+- `strict` - Use the strict mode described below (ordered output, fail-fast errors, bounded read-ahead). Defaults to `False`, preserving the historical behaviour.
+- `max_in_flight` - Strict mode only: the maximum number of rows that may be read from the source but not yet delivered downstream. Defaults to `2 * num_processors`. Only meaningful with `strict=True`.
 
 A few important notes regarding the `parallelize` processor - 
 - `row_func` runs in the context of a new process, so don't assume it has access to any global variables or state that were available in the main process
-- Due to its parallel nature, rows might change their order in the output of this processor.
+- Unless `strict=True`, rows might change their order in the output of this processor.
 - `predicate` is an important tool in optimizing perforance - since it's more tiem consuming, we only want to pass rows to the worker processes if there's work to be done there. In fact, until the predicate returns `True` for the first time, no worker processes are even created.
+
+##### Strict mode
+
+The default mode favors throughput and can reorder rows, silently swallow a failing `row_func` (the original row is emitted as if it succeeded) and read arbitrarily far ahead of a slow row. That is wrong when the processor is followed by order-sensitive processors such as `deduplicate`, or when it feeds a database. Pass `strict=True` to get the following guarantees:
+
+- **Order is preserved.** Rows are emitted in exactly the source order, no matter in which order the workers finish. Rows which don't match `predicate` are passed through in their original position rather than being pulled out of the stream.
+- **Read-ahead is bounded.** At most `max_in_flight` rows are read from the source but not yet delivered downstream. The bound is on total read-ahead, so a slow first row cannot make the queues (and memory usage) grow without limit; `max_in_flight` defaults to `2 * num_processors` so that all workers stay busy.
+- **Errors fail the flow.** An exception raised by `row_func`, an unserializable row, a worker process which dies (including `os._exit` or `sys.exit` inside `row_func`) or a failing source iterator raises a `ProcessorError` instead of being swallowed. A partially processed row is never passed downstream as if it had succeeded.
+- **Early stop releases resources.** If the consumer stops iterating early (or a downstream processor raises), the worker processes, both helper threads and the inter-process queues are torn down before control returns.
+
+Strict mode uses `multiprocessing.Queue` and pickles rows explicitly, so rows must be picklable, both on the way in and on the way out.
+
+Example (ordered, fail-fast):
+
+```python
+import requests
+
+data = [dict(url=url) for url in list_of_urls]
+
+def fetch(row):
+  row['data'] = requests.get(row['url']).content
+
+Flow(
+  data,
+  parallelize(fetch, strict=True, max_in_flight=64),
+  dump_to_path('scraper')
+).process()
+```
 
 Example:
 

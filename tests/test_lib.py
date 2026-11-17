@@ -2534,6 +2534,193 @@ def test_parallelize():
     ).results()[0][0][:100]
 
 
+def _parallelize_slow_mult(row):
+    import time
+    # Make later rows finish before earlier ones to shake out ordering bugs.
+    if row['a'] < 5:
+        time.sleep(0.2)
+    row['c'] = row['a'] * row['b']
+
+
+def _parallelize_boom(row):
+    if row['a'] == 7:
+        raise ValueError('boom on row 7')
+    row['c'] = row['a'] * row['b']
+
+
+def _parallelize_crash(row):
+    import os
+    if row['a'] == 5:
+        os._exit(17)
+    row['c'] = row['a'] * row['b']
+
+
+def test_parallelize_strict_keeps_order():
+    from dataflows import Flow, parallelize, add_field
+    data = [dict(a=i, b=i) for i in range(200)]
+
+    res = Flow(
+        data,
+        add_field('c', 'integer'),
+        parallelize(_parallelize_slow_mult, strict=True, num_processors=4),
+    ).results()[0][0]
+
+    assert [row['a'] for row in res] == list(range(200))
+    assert all(row['c'] == row['a'] * row['b'] for row in res)
+
+
+def test_parallelize_strict_predicate_keeps_position():
+    from dataflows import Flow, parallelize
+    data = [dict(a=i, b=2) for i in range(60)]
+
+    res = Flow(
+        data,
+        parallelize(_parallelize_slow_mult, strict=True, num_processors=3,
+                    predicate=lambda row: row['a'] % 4 == 0),
+    ).results()[0][0]
+
+    assert [row['a'] for row in res] == list(range(60))
+    for row in res:
+        if row['a'] % 4 == 0:
+            assert row['c'] == row['a'] * 2
+        else:
+            assert 'c' not in row
+
+
+def test_parallelize_strict_bounds_read_ahead():
+    import importlib
+
+    parallelize_module = importlib.import_module('dataflows.processors.parallelize')
+    from dataflows import Flow, parallelize
+
+    read = {'count': 0}
+    delivered = {'count': 0}
+    gap = {'max': 0}
+
+    class CountingIterator:
+        def __init__(self, iterable):
+            self.it = iter(iterable)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            row = next(self.it)
+            read['count'] += 1
+            gap['max'] = max(gap['max'], read['count'] - delivered['count'])
+            return row
+
+    original_init = parallelize_module._StrictRun.__init__
+    original_iter = parallelize_module._StrictRun.__iter__
+
+    def init(self, first_row, iterator, *args, **kwargs):
+        # The first row is read before the run starts to evaluate the
+        # predicate; count it here.
+        read['count'] = 1
+        original_init(self, first_row, CountingIterator(iterator), *args, **kwargs)
+
+    def iterate(self):
+        for row in original_iter(self):
+            delivered['count'] += 1
+            yield row
+
+    def slow_first(row):
+        import time
+        if row['a'] == 0:
+            time.sleep(0.5)  # a slow first row must not unbound the queues
+        row['c'] = row['a']
+
+    parallelize_module._StrictRun.__init__ = init
+    parallelize_module._StrictRun.__iter__ = iterate
+    try:
+        res = Flow(
+            [dict(a=i) for i in range(300)],
+            parallelize(slow_first, strict=True, num_processors=2, max_in_flight=5),
+        ).results()[0][0]
+    finally:
+        parallelize_module._StrictRun.__init__ = original_init
+        parallelize_module._StrictRun.__iter__ = original_iter
+
+    assert [row['a'] for row in res] == list(range(300))
+    assert gap['max'] <= 5, 'read-ahead exceeded max_in_flight: {}'.format(gap['max'])
+
+
+def test_parallelize_strict_row_error_fails_flow():
+    from dataflows import Flow, parallelize, add_field, exceptions
+    data = [dict(a=i, b=i) for i in range(30)]
+
+    with pytest.raises(exceptions.ProcessorError) as excinfo:
+        Flow(
+            data,
+            add_field('c', 'integer'),
+            parallelize(_parallelize_boom, strict=True, num_processors=2),
+        ).results()
+
+    assert 'boom on row 7' in str(excinfo.value)
+
+
+def test_parallelize_strict_worker_crash_fails_flow():
+    from dataflows import Flow, parallelize, add_field, exceptions
+    data = [dict(a=i, b=i) for i in range(20)]
+
+    with pytest.raises(exceptions.ProcessorError) as excinfo:
+        Flow(
+            data,
+            add_field('c', 'integer'),
+            parallelize(_parallelize_crash, strict=True, num_processors=2, max_in_flight=4),
+        ).results()
+
+    assert 'exit code 17' in str(excinfo.value)
+
+
+def test_parallelize_strict_releases_threads_and_processes_on_early_stop():
+    import gc
+    import multiprocessing
+    import threading
+    import time
+    from dataflows import Flow, parallelize, add_field
+    data = [dict(a=i, b=i) for i in range(2000)]
+
+    ds = Flow(
+        data,
+        add_field('c', 'integer'),
+        parallelize(mult, strict=True, num_processors=3, max_in_flight=6),
+    ).datastream()
+    resources = iter(ds.res_iter)
+    rows = next(resources)
+    head = []
+    for row in rows:
+        head.append(row)
+        if len(head) == 5:
+            break
+    assert [row['a'] for row in head] == list(range(5))
+
+    del rows, resources, ds
+    gc.collect()
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        leftover = [t for t in threading.enumerate() if 'parallelize' in t.name]
+        if not leftover and not multiprocessing.active_children():
+            break
+        time.sleep(0.1)
+    assert not [t for t in threading.enumerate() if 'parallelize' in t.name]
+    assert not multiprocessing.active_children()
+
+
+def test_parallelize_strict_argument_validation():
+    from dataflows import parallelize
+
+    with pytest.raises(ValueError):
+        parallelize(mult, strict=True, max_in_flight=0)
+    with pytest.raises(ValueError):
+        parallelize(mult, strict=True, max_in_flight=-1)
+    with pytest.raises(ValueError):
+        parallelize(mult, max_in_flight=10)  # only meaningful in strict mode
+    with pytest.raises(ValueError):
+        parallelize(mult, num_processors=-1)
+
+
 def test_delete_resource():
     from dataflows import Flow, delete_resource, update_resource
     data = [dict(a=i, b=i) for i in range(3300)]
